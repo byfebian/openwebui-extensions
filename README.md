@@ -1,4 +1,4 @@
-# OpenWebUI-Extensions
+# OpenWebUI Extensions
 
 A curated collection of [Open WebUI](https://github.com/open-webui/open-webui) tools and functions that I use, modify, and build for myself.
 

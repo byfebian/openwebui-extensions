@@ -1,0 +1,2120 @@
+"""
+title: Sub Agent
+author: skyzi000
+version: 0.4.9
+modified_by: byfebian
+modified version: 0.0.1
+license: MIT
+required_open_webui_version: 0.7.0
+description: Run autonomous, tool-heavy tasks in a sub-agent and keep the main chat context clean.
+
+Open WebUI v0.7 introduced powerful builtin tools (web search, memory, notes,
+knowledge bases, etc.), making complex multi-step tasks possible. However,
+heavy tool usage can hit context window limits, causing conversations to fail
+silently without returning a response.
+
+This tool solves that problem by delegating tool-heavy tasks to sub-agents
+running in isolated contexts. The sub-agent executes tools autonomously,
+then returns only the final result - keeping your main conversation clean
+and efficient.
+
+Requirements:
+- Native Function Calling must be enabled for the model
+  (Model settings > Advanced Params> Function Calling: native)
+
+Inspired by VS Code's runSubagent functionality, this tool was developed from scratch specifically for Open WebUI to ensure seamless integration and optimal performance.
+
+Modifications by byfebian (0.0.1):
+- MAX_CONCURRENT_API_CALLS: Semaphore to limit concurrent API calls from sub-agents.
+  Default 2 (reserves 1 slot for main chat). Set to match your API provider's
+  concurrent model limit minus 1.
+- PARALLEL_EXECUTION: Toggle between parallel and sequential task execution.
+  Default False (sequential) for safer operation with API-limited providers
+  (e.g. Ollama Cloud with 3-model limit, Brave Search with 1 req/sec free tier).
+  Set to True for faster parallel execution if your API can handle it.
+- TOOL_CALL_COOLDOWN: Seconds to wait between tool call iterations.
+  Default 1.0s to respect rate-limited tool APIs (e.g. Brave Search free tier).
+  Set to 0 to disable.
+- Retry with exponential backoff on transient API errors (429, 5xx, connection).
+- Fixed request.body() double-read bug affecting terminal_id and tool_servers resolution.
+- Deduplicated setup code between run_sub_agent and run_parallel_sub_agents.
+"""
+
+import asyncio
+import ast
+import json
+import logging
+import re
+import uuid
+from collections.abc import Mapping, Sequence
+from typing import Any, Callable, List, NamedTuple, Optional, Type
+
+from fastapi import Request
+from starlette.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Concurrency Control
+# ============================================================================
+
+_MAX_CONCURRENT_API_CALLS = 2
+_api_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_api_semaphore(max_concurrent: int) -> asyncio.Semaphore:
+    global _api_semaphore, _MAX_CONCURRENT_API_CALLS
+    if _api_semaphore is None or _MAX_CONCURRENT_API_CALLS != max_concurrent:
+        _MAX_CONCURRENT_API_CALLS = max_concurrent
+        _api_semaphore = asyncio.Semaphore(max_concurrent)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                f"[SubAgent] API semaphore initialized with limit={max_concurrent}"
+            )
+    return _api_semaphore
+
+
+# ============================================================================
+# Retry Helper
+# ============================================================================
+
+_MAX_RETRIES = 3
+_INITIAL_BACKOFF = 2.0
+_BACKOFF_MULTIPLIER = 2.0
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    exc_str = str(exc).lower()
+    if any(s in exc_str for s in ("429", "rate", "too many requests")):
+        return True
+    if any(s in exc_str for s in ("502", "503", "504", "server error", "overloaded")):
+        return True
+    if any(
+        s in exc_str
+        for s in ("connectionerror", "connection reset", "timed out", "timeout")
+    ):
+        return True
+    return False
+
+
+async def _retry_with_backoff(coro_factory: Callable, label: str = "") -> Any:
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_exc = e
+            if attempt < _MAX_RETRIES and _is_transient_error(e):
+                delay = _INITIAL_BACKOFF * (_BACKOFF_MULTIPLIER ** (attempt - 1))
+                log.warning(
+                    f"[SubAgent] {label} attempt {attempt}/{_MAX_RETRIES} failed "
+                    f"with transient error: {e}. Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                break
+    raise last_exc
+
+
+# ============================================================================
+# Request Body Cache (fixes double-read bug)
+# ============================================================================
+
+
+async def _read_request_body(request: Optional[Request]) -> Optional[dict]:
+    if request is None:
+        return None
+    request_body = getattr(request, "body", None)
+    if not callable(request_body):
+        return None
+    try:
+        raw_body = await request_body()
+        if raw_body:
+            return json.loads(raw_body)
+    except Exception:
+        pass
+    return None
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+BUILTIN_TOOL_CATEGORIES = {
+    "time": {"get_current_timestamp", "calculate_timestamp"},
+    "web": {"search_web", "fetch_url"},
+    "image": {"generate_image", "edit_image"},
+    "knowledge": {
+        "list_knowledge_bases",
+        "search_knowledge_bases",
+        "query_knowledge_bases",
+        "search_knowledge_files",
+        "query_knowledge_files",
+        "view_file",
+        "view_knowledge_file",
+    },
+    "chat": {"search_chats", "view_chat"},
+    "memory": {
+        "search_memories",
+        "add_memory",
+        "replace_memory_content",
+        "delete_memory",
+        "list_memories",
+    },
+    "notes": {
+        "search_notes",
+        "view_note",
+        "write_note",
+        "replace_note_content",
+    },
+    "channels": {
+        "search_channels",
+        "search_channel_messages",
+        "view_channel_thread",
+        "view_channel_message",
+    },
+    "code_interpreter": {"execute_code"},
+    "skills": {"view_skill"},
+}
+
+VALVE_TO_CATEGORY = {
+    "ENABLE_TIME_TOOLS": "time",
+    "ENABLE_WEB_TOOLS": "web",
+    "ENABLE_IMAGE_TOOLS": "image",
+    "ENABLE_KNOWLEDGE_TOOLS": "knowledge",
+    "ENABLE_CHAT_TOOLS": "chat",
+    "ENABLE_MEMORY_TOOLS": "memory",
+    "ENABLE_NOTES_TOOLS": "notes",
+    "ENABLE_CHANNELS_TOOLS": "channels",
+    "ENABLE_CODE_INTERPRETER_TOOLS": "code_interpreter",
+    "ENABLE_SKILLS_TOOLS": "skills",
+}
+
+CITATION_TOOLS = {
+    "search_web",
+    "view_knowledge_file",
+    "query_knowledge_files",
+    "fetch_url",
+}
+
+EXTERNAL_TOOL_TYPES = {"external", "action", "terminal"}
+
+TERMINAL_EVENT_TOOLS = {
+    "display_file",
+    "write_file",
+    "replace_file_content",
+    "run_command",
+}
+
+
+# ============================================================================
+# Helper functions (outside class - AI cannot invoke these)
+# ============================================================================
+
+
+def coerce_user_valves(raw_valves: Any, valves_cls: Type[BaseModel]) -> BaseModel:
+    """Normalize raw user valves into the target valves class."""
+    if isinstance(raw_valves, valves_cls):
+        return raw_valves
+    if isinstance(raw_valves, BaseModel):
+        try:
+            data = raw_valves.model_dump()
+        except Exception:
+            data = {}
+        return valves_cls.model_validate(data)
+    if isinstance(raw_valves, dict):
+        return valves_cls.model_validate(raw_valves)
+    return valves_cls.model_validate({})
+
+
+def model_has_note_knowledge(model: Optional[dict]) -> bool:
+    """Return True if the current model has note-type attached knowledge."""
+    if not isinstance(model, dict):
+        return False
+    knowledge_items = model.get("info", {}).get("meta", {}).get("knowledge") or []
+    if not isinstance(knowledge_items, list):
+        return False
+    return any(
+        item.get("type") == "note" for item in knowledge_items if isinstance(item, dict)
+    )
+
+
+def model_knowledge_tools_enabled(model: Optional[dict]) -> bool:
+    """Return True if model-level builtin knowledge tools are enabled."""
+    if not isinstance(model, dict):
+        return True
+    builtin_tools = model.get("info", {}).get("meta", {}).get("builtinTools", {})
+    if not isinstance(builtin_tools, dict):
+        return True
+    return bool(builtin_tools.get("knowledge", True))
+
+
+async def resolve_terminal_id_for_sub_agent(
+    *,
+    metadata: Optional[dict],
+    request_body: Optional[dict],
+    debug: bool,
+) -> str:
+    """Resolve terminal_id using cached request body first, then metadata."""
+
+    def normalize_terminal_id(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        return value.strip()
+
+    metadata_terminal_id = ""
+    if isinstance(metadata, dict):
+        metadata_terminal_id = normalize_terminal_id(metadata.get("terminal_id"))
+
+    request_terminal_id = ""
+    if isinstance(request_body, dict):
+        request_terminal_id = normalize_terminal_id(request_body.get("terminal_id"))
+        if not request_terminal_id:
+            nested_metadata = request_body.get("metadata")
+            if isinstance(nested_metadata, dict):
+                request_terminal_id = normalize_terminal_id(
+                    nested_metadata.get("terminal_id")
+                )
+
+    if request_terminal_id:
+        if (
+            debug
+            and metadata_terminal_id
+            and metadata_terminal_id != request_terminal_id
+        ):
+            log.warning(
+                "[SubAgent] terminal_id mismatch between request body and metadata; "
+                "using request body terminal_id to match parent agent behavior"
+            )
+        return request_terminal_id
+
+    if metadata_terminal_id:
+        return metadata_terminal_id
+
+    return ""
+
+
+def normalize_direct_tool_servers(value: Any) -> List[dict]:
+    """Normalize direct tool server payload into a list of dict copies."""
+    if not isinstance(value, list):
+        return []
+    normalized = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(dict(item))
+    return normalized
+
+
+async def resolve_direct_tool_servers_for_sub_agent(
+    *,
+    metadata: Optional[dict],
+    request_body: Optional[dict],
+    debug: bool,
+) -> List[dict]:
+    """Resolve direct tool servers from cached request body first, then metadata."""
+    metadata_servers = normalize_direct_tool_servers(
+        (metadata or {}).get("tool_servers") if isinstance(metadata, dict) else None
+    )
+
+    request_servers: List[dict] = []
+    if isinstance(request_body, dict):
+        request_servers = normalize_direct_tool_servers(
+            request_body.get("tool_servers")
+        )
+        if not request_servers:
+            nested_metadata = request_body.get("metadata")
+            if isinstance(nested_metadata, dict):
+                request_servers = normalize_direct_tool_servers(
+                    nested_metadata.get("tool_servers")
+                )
+
+    if request_servers:
+        if debug and metadata_servers and len(metadata_servers) != len(request_servers):
+            log.warning(
+                "[SubAgent] tool_servers mismatch between request body and metadata; "
+                "using request body tool_servers"
+            )
+        return request_servers
+
+    return metadata_servers
+
+
+def build_direct_tools_dict(*, tool_servers: List[dict], debug: bool) -> dict:
+    """Build direct tool entries compatible with Open WebUI middleware."""
+    direct_tools = {}
+    for server in tool_servers:
+        if not isinstance(server, dict):
+            continue
+
+        specs = server.get("specs", [])
+        if not isinstance(specs, list) or not specs:
+            continue
+
+        server_payload = {k: v for k, v in server.items() if k != "specs"}
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            direct_tools[name] = {
+                "spec": spec,
+                "direct": True,
+                "server": server_payload,
+                "type": "direct",
+            }
+
+    if debug and tool_servers and not direct_tools:
+        log.info("[SubAgent] No direct tools loaded from tool_servers")
+
+    return direct_tools
+
+
+async def execute_direct_tool_call(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool: dict,
+    extra_params: dict,
+) -> Any:
+    """Execute direct tools through __event_call__ like core middleware."""
+    event_call = extra_params.get("__event_call__")
+    if not callable(event_call):
+        raise RuntimeError("Direct tool execution requires __event_call__ context")
+
+    metadata = extra_params.get("__metadata__")
+    session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+    return await event_call(
+        {
+            "type": "execute:tool",
+            "data": {
+                "id": str(uuid.uuid4()),
+                "name": tool_function_name,
+                "params": tool_function_params,
+                "server": tool.get("server", {}),
+                "session_id": session_id,
+            },
+        }
+    )
+
+
+def extract_tool_result_payload(
+    *, tool_type: str, tool_result: Any, direct_tool: bool = False
+) -> Any:
+    """Extract serializable payload from tool result for external/terminal-style tools."""
+    if (
+        tool_type in EXTERNAL_TOOL_TYPES
+        and isinstance(tool_result, tuple)
+        and len(tool_result) == 2
+    ):
+        return tool_result[0]
+    if direct_tool and isinstance(tool_result, list) and len(tool_result) == 2:
+        return tool_result[0]
+    return tool_result
+
+
+async def emit_terminal_tool_event(
+    *,
+    tool_function_name: str,
+    tool_function_params: dict,
+    tool_result: Any,
+    event_emitter: Optional[Callable],
+) -> None:
+    """Emit terminal:* UI events for Open Terminal tool results."""
+    if not event_emitter or tool_function_name not in TERMINAL_EVENT_TOOLS:
+        return
+
+    if tool_function_name == "display_file":
+        path = (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        parsed = tool_result
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                parsed = tool_result
+        if isinstance(parsed, dict) and parsed.get("exists") is False:
+            return
+        event = {"type": "terminal:display_file", "data": {"path": path}}
+    elif tool_function_name in {"write_file", "replace_file_content"}:
+        path = (
+            tool_function_params.get("path", "")
+            if isinstance(tool_function_params, dict)
+            else ""
+        )
+        if not isinstance(path, str) or not path:
+            return
+        event = {"type": f"terminal:{tool_function_name}", "data": {"path": path}}
+    elif tool_function_name == "run_command":
+        event = {"type": "terminal:run_command", "data": {}}
+    else:
+        return
+
+    try:
+        await event_emitter(event)
+    except Exception as e:
+        log.warning(f"Error emitting terminal event for {tool_function_name}: {e}")
+
+
+async def execute_tool_call(
+    tool_call: dict,
+    tools_dict: dict,
+    extra_params: dict,
+    event_emitter: Optional[Callable] = None,
+) -> dict:
+    """Execute a single tool call and return the result.
+
+    Args:
+        tool_call: The tool call dict with id, function.name, function.arguments
+        tools_dict: Dict of available tools {name: {callable, spec, ...}}
+        extra_params: Extra parameters to pass to tool functions
+        event_emitter: Optional event emitter for citation/source events
+
+    Returns:
+        Dict with tool_call_id and content (result)
+    """
+    if not isinstance(tool_call, dict):
+        return {
+            "tool_call_id": str(uuid.uuid4()),
+            "content": f"Malformed tool_call: expected dict, got {type(tool_call).__name__}",
+        }
+    tool_call_id = tool_call.get("id", str(uuid.uuid4()))
+    func = tool_call.get("function")
+    if not isinstance(func, dict):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": f"Malformed tool_call: 'function' is {type(func).__name__}, not dict",
+        }
+    tool_function_name = func.get("name", "")
+    tool_args_raw = func.get("arguments", "{}")
+
+    tool_function_params: dict = {}
+    if isinstance(tool_args_raw, dict):
+        tool_function_params = tool_args_raw
+    elif isinstance(tool_args_raw, str):
+        try:
+            tool_function_params = ast.literal_eval(tool_args_raw)
+        except Exception:
+            try:
+                tool_function_params = json.loads(tool_args_raw)
+            except Exception as e:
+                log.error(f"Error parsing tool call arguments: {tool_args_raw} - {e}")
+                return {
+                    "tool_call_id": tool_call_id,
+                    "content": f"Error parsing arguments: {e}",
+                }
+    if not isinstance(tool_function_params, dict):
+        tool_function_params = {}
+
+    tool_result = None
+    emit_terminal_event = False
+    if tool_function_name in tools_dict:
+        tool = tools_dict[tool_function_name]
+        spec = tool.get("spec", {})
+        direct_tool = bool(tool.get("direct", False))
+
+        try:
+            allowed_params = spec.get("parameters", {}).get("properties", {}).keys()
+            tool_function_params = {
+                k: v for k, v in tool_function_params.items() if k in allowed_params
+            }
+
+            if direct_tool:
+                tool_result = await execute_direct_tool_call(
+                    tool_function_name=tool_function_name,
+                    tool_function_params=tool_function_params,
+                    tool=tool,
+                    extra_params=extra_params,
+                )
+            else:
+                tool_function = tool["callable"]
+
+                from open_webui.utils.tools import get_updated_tool_function
+
+                tool_function = await get_updated_tool_function(
+                    function=tool_function,
+                    extra_params={
+                        "__messages__": extra_params.get("__messages__", []),
+                        "__files__": extra_params.get("__files__", []),
+                        "__event_emitter__": extra_params.get("__event_emitter__"),
+                        "__event_call__": extra_params.get("__event_call__"),
+                    },
+                )
+
+                tool_result = await tool_function(**tool_function_params)
+
+            tool_type = tool.get("type", "")
+            tool_result = extract_tool_result_payload(
+                tool_type=tool_type,
+                tool_result=tool_result,
+                direct_tool=direct_tool,
+            )
+            emit_terminal_event = True
+
+        except Exception as e:
+            log.exception(f"Error executing tool {tool_function_name}: {e}")
+            tool_result = f"Error: {e}"
+    else:
+        tool_result = f"Tool '{tool_function_name}' not found"
+
+    if emit_terminal_event:
+        await emit_terminal_tool_event(
+            tool_function_name=tool_function_name,
+            tool_function_params=tool_function_params,
+            tool_result=tool_result,
+            event_emitter=event_emitter,
+        )
+
+    if tool_result is None:
+        tool_result = ""
+    elif not isinstance(tool_result, str):
+        try:
+            tool_result = json.dumps(tool_result, ensure_ascii=False, default=str)
+        except Exception:
+            tool_result = str(tool_result)
+
+    if event_emitter and tool_result and tool_function_name in CITATION_TOOLS:
+        try:
+            from open_webui.utils.middleware import get_citation_source_from_tool_result
+
+            tool_id = tools_dict.get(tool_function_name, {}).get("tool_id", "")
+            citation_sources = get_citation_source_from_tool_result(
+                tool_name=tool_function_name,
+                tool_params=tool_function_params,
+                tool_result=tool_result,
+                tool_id=tool_id,
+            )
+            for source in citation_sources:
+                await event_emitter({"type": "source", "data": source})
+        except Exception as e:
+            log.warning(
+                f"Error extracting citation sources from {tool_function_name}: {e}"
+            )
+
+    return {
+        "tool_call_id": tool_call_id,
+        "content": tool_result,
+    }
+
+
+async def apply_inlet_filters_if_enabled(
+    apply_inlet_filters: bool,
+    request: Request,
+    model: dict,
+    form_data: dict,
+    extra_params: dict,
+) -> dict:
+    """Apply inlet filters to form_data if enabled.
+
+    Args:
+        apply_inlet_filters: Whether to apply inlet filters
+        request: FastAPI request object
+        model: Model info dict
+        form_data: Form data dict to process
+        extra_params: Extra parameters for filter processing
+
+    Returns:
+        Processed form_data (may be modified by filters)
+    """
+    if not apply_inlet_filters:
+        return form_data
+
+    try:
+        from open_webui.models.functions import Functions
+        from open_webui.utils.filter import (
+            get_sorted_filter_ids,
+            process_filter_functions,
+        )
+
+        local_extra_params = dict(extra_params or {})
+        if isinstance(local_extra_params.get("__user__"), dict):
+            local_extra_params["__user__"] = dict(local_extra_params["__user__"])
+
+        filter_ids = await get_sorted_filter_ids(
+            request, model, form_data.get("metadata", {}).get("filter_ids", [])
+        )
+        filter_functions = await asyncio.gather(
+            *(Functions.get_function_by_id(fid) for fid in filter_ids)
+        )
+        filter_functions = list(filter_functions)
+        form_data, _ = await process_filter_functions(
+            request=request,
+            filter_functions=filter_functions,
+            filter_type="inlet",
+            form_data=form_data,
+            extra_params=local_extra_params,
+        )
+    except Exception as e:
+        log.warning(f"Error applying inlet filters: {e}")
+
+    return form_data
+
+
+async def _generate_completion_with_semaphore(
+    *,
+    request: Request,
+    form_data: dict,
+    user: Any,
+    max_concurrent: int,
+    label: str = "completion",
+) -> Any:
+    """Call generate_chat_completion gated by the API concurrency semaphore.
+
+    Also wraps the call with retry + exponential backoff for transient errors.
+    """
+    from open_webui.utils.chat import generate_chat_completion
+
+    semaphore = _get_api_semaphore(max_concurrent)
+
+    async def _do_call():
+        async with semaphore:
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug(f"[SubAgent] {label}: semaphore acquired")
+            return await generate_chat_completion(
+                request=request,
+                form_data=form_data,
+                user=user,
+                bypass_filter=True,
+            )
+
+    return await _retry_with_backoff(_do_call, label=label)
+
+
+async def run_sub_agent_loop(
+    request: Request,
+    user: Any,
+    model_id: str,
+    messages: List[dict],
+    tools_dict: dict,
+    max_iterations: int,
+    event_emitter: Optional[Callable] = None,
+    extra_params: Optional[dict] = None,
+    apply_inlet_filters: bool = True,
+    max_concurrent_api_calls: int = 2,
+    tool_call_cooldown: float = 1.0,
+) -> str:
+    """Run the sub-agent tool loop until completion.
+
+    Args:
+        request: FastAPI request object
+        user: User model object
+        model_id: Model ID to use for completions
+        messages: Initial messages for the sub-agent
+        tools_dict: Dict of available tools
+        max_iterations: Maximum number of tool call iterations
+        event_emitter: Optional event emitter for status updates
+        extra_params: Extra parameters for tool execution
+        apply_inlet_filters: Whether to apply inlet filters (outlet filters are never applied)
+        max_concurrent_api_calls: Max concurrent generate_chat_completion calls across all sub-agents
+        tool_call_cooldown: Seconds to wait between tool call iterations (0 to disable)
+
+    Returns:
+        Final text response from the sub-agent
+    """
+    from open_webui.models.users import UserModel
+
+    if extra_params is None:
+        extra_params = {}
+
+    if isinstance(user, dict):
+        user_obj = UserModel(**user)
+    else:
+        user_obj = user
+
+    models = request.app.state.MODELS
+    model = models.get(model_id, {})
+
+    tools_param = None
+    if tools_dict:
+        tools_param = [
+            {"type": "function", "function": tool.get("spec", {})}
+            for tool in tools_dict.values()
+        ]
+
+    current_messages = list(messages)
+    iteration = 0
+
+    while iteration < max_iterations:
+        iteration += 1
+
+        if event_emitter:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Sub-agent iteration {iteration}/{max_iterations}",
+                        "done": False,
+                    },
+                }
+            )
+
+        iteration_info = f"[Iteration {iteration}/{max_iterations}]"
+        if iteration == max_iterations:
+            iteration_info += " This is your FINAL tool call opportunity."
+
+        messages_with_context = current_messages + [
+            {"role": "system", "content": iteration_info}
+        ]
+
+        form_data = {
+            "model": model_id,
+            "messages": messages_with_context,
+            "stream": False,
+            "metadata": {
+                "task": "sub_agent",
+                "sub_agent_iteration": iteration,
+                "filter_ids": extra_params.get("__metadata__", {}).get(
+                    "filter_ids", []
+                ),
+            },
+        }
+
+        if tools_param:
+            form_data["tools"] = tools_param
+
+        form_data = await apply_inlet_filters_if_enabled(
+            apply_inlet_filters, request, model, form_data, extra_params
+        )
+
+        try:
+            response = await _generate_completion_with_semaphore(
+                request=request,
+                form_data=form_data,
+                user=user_obj,
+                max_concurrent=max_concurrent_api_calls,
+                label=f"sub-agent iteration {iteration}/{max_iterations}",
+            )
+        except Exception as e:
+            log.exception(f"Error in sub-agent completion after retries: {e}")
+            return f"Error during sub-agent execution: {e}"
+
+        if isinstance(response, JSONResponse):
+            try:
+                error_data = json.loads(bytes(response.body).decode("utf-8"))
+                error_field = (
+                    error_data.get("error") if isinstance(error_data, dict) else None
+                )
+                if isinstance(error_field, dict):
+                    error_msg = error_field.get("message", str(error_data))
+                elif isinstance(error_field, str):
+                    error_msg = error_field
+                else:
+                    error_msg = (
+                        error_data.get("message", str(error_data))
+                        if isinstance(error_data, dict)
+                        else str(error_data)
+                    )
+                return f"API error: {error_msg}"
+            except Exception:
+                return f"API error (status {response.status_code}): Failed to parse response"
+
+        if isinstance(response, dict):
+            choices = response.get("choices", [])
+            if not choices:
+                return "No response from model"
+
+            choice = choices[0]
+            if not isinstance(choice, Mapping):
+                return f"API returned malformed response: choices[0] is {type(choice).__name__}, not a mapping"
+
+            message = choice.get("message", {})
+            if not isinstance(message, Mapping):
+                return f"API returned malformed response: message is {type(message).__name__}, not a mapping"
+
+            content = message.get("content", "")
+            tool_calls = message.get("tool_calls", [])
+
+            if event_emitter and content:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"[Step {iteration}] Assistant: {content.replace(chr(10), ' ')}",
+                            "done": False,
+                        },
+                    }
+                )
+
+            if not tool_calls:
+                return content or ""
+
+            if not isinstance(tool_calls, Sequence) or isinstance(
+                tool_calls, (str, bytes)
+            ):
+                return (
+                    f"API returned malformed response: tool_calls is "
+                    f"{type(tool_calls).__name__}, not a sequence. "
+                    f"Content so far: {content or '(none)'}"
+                )
+            raw_count = len(tool_calls)
+            tool_calls = [tc for tc in tool_calls if isinstance(tc, Mapping)]
+            if not tool_calls:
+                if raw_count > 0:
+                    return (
+                        f"API returned malformed response: {raw_count} tool_calls "
+                        f"entries were all non-mapping. "
+                        f"Content so far: {content or '(none)'}"
+                    )
+                return content or ""
+
+            if event_emitter:
+                tool_names = [
+                    (
+                        tc["function"].get("name", "unknown")
+                        if isinstance(tc.get("function"), Mapping)
+                        else "malformed"
+                    )
+                    for tc in tool_calls
+                ]
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"[Step {iteration}] Tool calls: {', '.join(tool_names)}",
+                            "done": False,
+                        },
+                    }
+                )
+
+            normalized_tool_calls = []
+            for tc in tool_calls:
+                tc_func = tc.get("function")
+                if not isinstance(tc_func, Mapping):
+                    continue
+                args = tc_func.get("arguments", "{}")
+                if not isinstance(args, str):
+                    try:
+                        args = json.dumps(args, ensure_ascii=False)
+                    except Exception:
+                        args = str(args)
+                normalized_tool_calls.append(
+                    {
+                        **tc,
+                        "function": {**tc_func, "arguments": args},
+                    }
+                )
+            if not normalized_tool_calls:
+                return (
+                    f"API returned malformed response: all tool_calls had invalid "
+                    f"'function' fields. Content so far: {content or '(none)'}"
+                )
+
+            current_messages.append(
+                {
+                    "role": "assistant",
+                    "content": content or "",
+                    "tool_calls": normalized_tool_calls,
+                }
+            )
+
+            for tool_call in normalized_tool_calls:
+                tc_func = tool_call.get("function")
+                tool_args_raw = (
+                    tc_func.get("arguments", "{}")
+                    if isinstance(tc_func, dict)
+                    else "{}"
+                )
+                tool_args_display = (
+                    str(tool_args_raw).replace(chr(10), " ") if tool_args_raw else "{}"
+                )
+
+                if event_emitter:
+                    await event_emitter(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"[Step {iteration}] Args: {tool_args_display}",
+                                "done": False,
+                            },
+                        }
+                    )
+
+                result = await execute_tool_call(
+                    tool_call,
+                    tools_dict,
+                    {
+                        **extra_params,
+                        "__messages__": current_messages,
+                    },
+                    event_emitter=event_emitter,
+                )
+
+                if event_emitter:
+                    result_content = (
+                        result["content"].replace(chr(10), " ")
+                        if result["content"]
+                        else "(empty)"
+                    )
+                    await event_emitter(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"[Step {iteration}] Result: {result_content}",
+                                "done": False,
+                            },
+                        }
+                    )
+
+                current_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": result["tool_call_id"],
+                        "content": result["content"],
+                    }
+                )
+
+            if tool_call_cooldown > 0:
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        f"[SubAgent] Sleeping {tool_call_cooldown}s cooldown between tool iterations"
+                    )
+                await asyncio.sleep(tool_call_cooldown)
+
+        else:
+            return f"Unexpected response type: {type(response)}"
+
+    if event_emitter:
+        await event_emitter(
+            {
+                "type": "status",
+                "data": {
+                    "description": f"Max iterations ({max_iterations}) reached",
+                    "done": False,
+                },
+            }
+        )
+
+    form_data = {
+        "model": model_id,
+        "messages": current_messages
+        + [
+            {
+                "role": "user",
+                "content": "Maximum tool iterations reached. Please provide your final answer based on the information gathered so far.",
+            }
+        ],
+        "stream": False,
+        "metadata": {
+            "task": "sub_agent",
+            "sub_agent_iteration": max_iterations + 1,
+            "filter_ids": extra_params.get("__metadata__", {}).get("filter_ids", []),
+        },
+    }
+
+    form_data = await apply_inlet_filters_if_enabled(
+        apply_inlet_filters, request, model, form_data, extra_params
+    )
+
+    try:
+        response = await _generate_completion_with_semaphore(
+            request=request,
+            form_data=form_data,
+            user=user_obj,
+            max_concurrent=max_concurrent_api_calls,
+            label="sub-agent final response",
+        )
+
+        if isinstance(response, dict):
+            choices = response.get("choices", [])
+            if choices:
+                choice = choices[0]
+                if isinstance(choice, Mapping):
+                    message = choice.get("message", {})
+                    if isinstance(message, Mapping):
+                        return message.get("content", "")
+    except Exception as e:
+        log.exception(f"Error getting final response after retries: {e}")
+
+    return "Sub-agent reached maximum iterations without providing a final response."
+
+
+_SKILLS_MANIFEST_START = "<available_skills>"
+_SKILLS_MANIFEST_END = "</available_skills>"
+
+_SKILL_TAG_PATTERN = re.compile(r"<skill name=.*?>\n.*?\n</skill>", re.DOTALL)
+
+
+def _find_manifest_in_text(text: str) -> str:
+    """Return the <available_skills>…</available_skills> substring, or ""."""
+    start = text.find(_SKILLS_MANIFEST_START)
+    if start == -1:
+        return ""
+    end = text.find(_SKILLS_MANIFEST_END, start)
+    if end == -1:
+        return ""
+    return text[start : end + len(_SKILLS_MANIFEST_END)]
+
+
+def _find_skill_tags_in_text(text: str) -> list[str]:
+    """Return all ``<skill name="...">…</skill>`` blocks found in *text*."""
+    return _SKILL_TAG_PATTERN.findall(text)
+
+
+def _extract_from_system_messages(
+    messages: Optional[list],
+    extractor,
+):
+    """Walk system messages and apply *extractor* to each text chunk.
+
+    ``extractor`` is called with a single ``str`` argument and should return a
+    list of results (or a single truthy result).  The function handles both
+    plain-string content and list-of-parts content
+    (``[{"type": "text", "text": "..."}]``).
+    """
+    results: list = []
+    if not messages:
+        return results
+    for msg in messages:
+        if msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            found = extractor(content)
+            if found:
+                (
+                    results.append(found)
+                    if isinstance(found, str)
+                    else results.extend(found)
+                )
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    found = extractor(part.get("text") or "")
+                    if found:
+                        (
+                            results.append(found)
+                            if isinstance(found, str)
+                            else results.extend(found)
+                        )
+    return results
+
+
+def extract_skill_manifest(messages: Optional[list]) -> str:
+    """Extract the ``<available_skills>`` manifest from the parent
+    conversation's system messages.
+
+    Since v0.8.2, only **model-attached** skills appear in this manifest.
+    User-selected skills are injected as full ``<skill>`` tags instead.
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        The manifest XML string, or empty string if not found.
+    """
+    results = _extract_from_system_messages(messages, _find_manifest_in_text)
+    return results[0] if results else ""
+
+
+def extract_user_skill_tags(messages: Optional[list]) -> list[str]:
+    """Extract ``<skill name="...">content</skill>`` tags from the parent
+    conversation's system messages.
+
+    Since Open WebUI v0.8.2, user-selected skills are injected as individual
+    ``<skill>`` tags with full content.
+
+    Args:
+        messages: The parent conversation messages (``__messages__``).
+
+    Returns:
+        A list of ``<skill …>…</skill>`` strings, possibly empty.
+    """
+    return _extract_from_system_messages(messages, _find_skill_tags_in_text)
+
+
+async def register_view_skill(
+    tools_dict: dict,
+    request: Request,
+    extra_params: dict,
+) -> None:
+    """Manually register the view_skill builtin tool in tools_dict.
+
+    This is needed for **model-attached** skills whose content is not injected
+    inline.  The sub-agent can call ``view_skill`` to lazily load their content
+    from the ``<available_skills>`` manifest.
+
+    Args:
+        tools_dict: The tools dict to add view_skill to (modified in-place).
+        request: FastAPI request object.
+        extra_params: Extra parameters for tool binding.
+    """
+    if "view_skill" in tools_dict:
+        return
+
+    try:
+        from open_webui.tools.builtin import view_skill
+        from open_webui.utils.tools import (
+            get_async_tool_function_and_apply_extra_params,
+            convert_function_to_pydantic_model,
+            convert_pydantic_model_to_openai_function_spec,
+        )
+
+        callable_fn = get_async_tool_function_and_apply_extra_params(
+            view_skill,
+            {
+                "__request__": request,
+                "__user__": extra_params.get("__user__", {}),
+                "__event_emitter__": extra_params.get("__event_emitter__"),
+                "__event_call__": extra_params.get("__event_call__"),
+                "__metadata__": extra_params.get("__metadata__"),
+                "__chat_id__": extra_params.get("__chat_id__"),
+                "__message_id__": extra_params.get("__message_id__"),
+            },
+        )
+
+        pydantic_model = convert_function_to_pydantic_model(view_skill)
+        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
+
+        tools_dict["view_skill"] = {
+            "tool_id": "builtin:view_skill",
+            "callable": callable_fn,
+            "spec": spec,
+            "type": "builtin",
+        }
+    except Exception as e:
+        log.warning(f"Failed to register view_skill: {e}")
+
+
+async def load_sub_agent_tools(
+    request: Request,
+    user: Any,
+    valves: Any,
+    metadata: dict,
+    model: dict,
+    extra_params: dict,
+    self_tool_id: Optional[str],
+) -> dict:
+    """Load regular + builtin tools for sub-agent, returns tools_dict."""
+    from open_webui.utils.tools import get_builtin_tools, get_tools
+
+    try:
+        from open_webui.utils.tools import get_terminal_tools
+    except Exception:
+        get_terminal_tools = None
+
+    metadata = metadata or {}
+    model = model or {}
+    extra_params = extra_params or {}
+    event_emitter = extra_params.get("__event_emitter__")
+    extra_metadata = extra_params.get("__metadata__")
+
+    request_body = await _read_request_body(request)
+    terminal_id = await resolve_terminal_id_for_sub_agent(
+        metadata=metadata,
+        request_body=request_body,
+        debug=bool(getattr(valves, "DEBUG", False)),
+    )
+    direct_tool_servers = await resolve_direct_tool_servers_for_sub_agent(
+        metadata=metadata,
+        request_body=request_body,
+        debug=bool(getattr(valves, "DEBUG", False)),
+    )
+
+    if terminal_id:
+        metadata["terminal_id"] = terminal_id
+        if isinstance(extra_metadata, dict):
+            extra_metadata["terminal_id"] = terminal_id
+        else:
+            extra_params["__metadata__"] = metadata
+            extra_metadata = metadata
+
+    if direct_tool_servers:
+        metadata["tool_servers"] = direct_tool_servers
+        if isinstance(extra_metadata, dict):
+            extra_metadata["tool_servers"] = direct_tool_servers
+        else:
+            extra_params["__metadata__"] = metadata
+
+    available_tool_ids = []
+    if metadata.get("tool_ids"):
+        available_tool_ids = list(metadata.get("tool_ids", []))
+
+    if valves.DEBUG:
+        log.info(f"[SubAgent] AVAILABLE_TOOL_IDS valve: '{valves.AVAILABLE_TOOL_IDS}'")
+        log.info(f"[SubAgent] Available tool_ids from metadata: {available_tool_ids}")
+        log.info(f"[SubAgent] self_tool_id: {self_tool_id}")
+        log.info(f"[SubAgent] resolved terminal_id: {terminal_id}")
+        log.info(f"[SubAgent] resolved direct tool servers: {len(direct_tool_servers)}")
+
+    excluded = set()
+    if valves.EXCLUDED_TOOL_IDS.strip():
+        excluded = {
+            tid.strip() for tid in valves.EXCLUDED_TOOL_IDS.split(",") if tid.strip()
+        }
+
+    if not self_tool_id:
+        log.warning(
+            "[SubAgent] self_tool_id is None, cannot exclude self from tool list. "
+            "Recursion prevention may not work."
+        )
+    else:
+        excluded.add(self_tool_id)
+
+    if valves.DEBUG:
+        log.info(f"[SubAgent] EXCLUDED_TOOL_IDS valve: '{valves.EXCLUDED_TOOL_IDS}'")
+        if excluded:
+            log.info(
+                f"[SubAgent] Excluded tool IDs (including self): {sorted(excluded)}"
+            )
+
+    if valves.AVAILABLE_TOOL_IDS.strip():
+        tool_id_list = [
+            tid.strip() for tid in valves.AVAILABLE_TOOL_IDS.split(",") if tid.strip()
+        ]
+        if valves.DEBUG:
+            log.info(f"[SubAgent] Using AVAILABLE_TOOL_IDS valve: {tool_id_list}")
+    else:
+        tool_id_list = available_tool_ids
+        if valves.DEBUG:
+            log.info(
+                f"[SubAgent] Using all available tool_ids from metadata: {tool_id_list}"
+            )
+
+    tool_id_list = [tid for tid in tool_id_list if tid not in excluded]
+
+    regular_tool_ids = [tid for tid in tool_id_list if not tid.startswith("builtin:")]
+
+    if valves.DEBUG:
+        log.info(f"[SubAgent] Regular tool IDs: {regular_tool_ids}")
+
+    tools_dict = {}
+    if regular_tool_ids:
+        try:
+            tools_dict = await get_tools(
+                request=request,
+                tool_ids=regular_tool_ids,
+                user=user,
+                extra_params=extra_params,
+            )
+
+            if valves.DEBUG:
+                log.info(f"[SubAgent] Loaded {len(tools_dict)} regular tools")
+
+        except Exception as e:
+            log.exception(f"Error loading tools: {e}")
+            if event_emitter:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Warning: Could not load tools: {e}",
+                            "done": False,
+                        },
+                    }
+                )
+
+    if terminal_id and bool(getattr(valves, "ENABLE_TERMINAL_TOOLS", True)):
+        if get_terminal_tools is None:
+            if valves.DEBUG:
+                log.info(
+                    "[SubAgent] get_terminal_tools is unavailable in this Open WebUI version"
+                )
+        else:
+            try:
+                terminal_tools = await get_terminal_tools(
+                    request=request,
+                    terminal_id=terminal_id,
+                    user=user,
+                    extra_params=extra_params,
+                )
+                if terminal_tools:
+                    duplicate_names = set(tools_dict.keys()) & set(
+                        terminal_tools.keys()
+                    )
+                    tools_dict = {**tools_dict, **terminal_tools}
+                    if valves.DEBUG:
+                        if duplicate_names:
+                            log.warning(
+                                "[SubAgent] Terminal tools overrode existing tool names: "
+                                f"{sorted(duplicate_names)}"
+                            )
+                        log.info(
+                            f"[SubAgent] Loaded {len(terminal_tools)} terminal tools for terminal_id={terminal_id}"
+                        )
+            except Exception as e:
+                log.exception(f"Error loading terminal tools: {e}")
+                if event_emitter:
+                    await event_emitter(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Warning: Could not load terminal tools: {e}",
+                                "done": False,
+                            },
+                        }
+                    )
+    elif terminal_id and valves.DEBUG:
+        log.info("[SubAgent] Terminal tools disabled by ENABLE_TERMINAL_TOOLS valve")
+
+    if direct_tool_servers:
+        try:
+            direct_tools = build_direct_tools_dict(
+                tool_servers=direct_tool_servers,
+                debug=bool(getattr(valves, "DEBUG", False)),
+            )
+            if direct_tools:
+                duplicate_names = set(tools_dict.keys()) & set(direct_tools.keys())
+                tools_dict = {**tools_dict, **direct_tools}
+                if valves.DEBUG:
+                    if duplicate_names:
+                        log.warning(
+                            "[SubAgent] Direct tools overrode existing tool names: "
+                            f"{sorted(duplicate_names)}"
+                        )
+                    log.info(f"[SubAgent] Loaded {len(direct_tools)} direct tools")
+        except Exception as e:
+            log.exception(f"Error loading direct tools: {e}")
+            if event_emitter:
+                await event_emitter(
+                    {
+                        "type": "status",
+                        "data": {
+                            "description": f"Warning: Could not load direct tools: {e}",
+                            "done": False,
+                        },
+                    }
+                )
+
+    try:
+        features = metadata.get("features", {})
+
+        builtin_extra_params = {
+            "__user__": extra_params.get("__user__"),
+            "__event_emitter__": event_emitter,
+            "__event_call__": extra_params.get("__event_call__"),
+            "__metadata__": extra_params.get("__metadata__"),
+            "__chat_id__": extra_params.get("__chat_id__"),
+            "__message_id__": extra_params.get("__message_id__"),
+            "__oauth_token__": extra_params.get("__oauth_token__"),
+        }
+
+        all_builtin_tools = await get_builtin_tools(
+            request=request,
+            extra_params=builtin_extra_params,
+            features=features,
+            model=model,
+        )
+
+        disabled_builtin_tools = set()
+        for valve_field, category in VALVE_TO_CATEGORY.items():
+            if not getattr(valves, valve_field):
+                disabled_builtin_tools.update(BUILTIN_TOOL_CATEGORIES[category])
+
+        knowledge_tools_enabled = bool(getattr(valves, "ENABLE_KNOWLEDGE_TOOLS", True))
+        notes_tools_enabled = bool(getattr(valves, "ENABLE_NOTES_TOOLS", True))
+        keep_view_note_for_knowledge = (
+            (not notes_tools_enabled)
+            and knowledge_tools_enabled
+            and model_knowledge_tools_enabled(model)
+            and model_has_note_knowledge(model)
+        )
+
+        builtin_count = 0
+        for name, tool_dict in all_builtin_tools.items():
+            if name in disabled_builtin_tools and not (
+                name == "view_note" and keep_view_note_for_knowledge
+            ):
+                continue
+
+            if name not in tools_dict:
+                tools_dict[name] = tool_dict
+                builtin_count += 1
+            elif valves.DEBUG:
+                log.warning(
+                    f"[SubAgent] Builtin tool '{name}' skipped: "
+                    "regular tool with same name takes priority"
+                )
+
+        if valves.DEBUG:
+            log.info(
+                f"[SubAgent] Loaded {builtin_count} builtin tools "
+                f"(disabled categories: {[c for v, c in VALVE_TO_CATEGORY.items() if not getattr(valves, v)]}). "
+                f"Total tools: {len(tools_dict)}"
+            )
+
+    except Exception as e:
+        log.exception(f"Error loading builtin tools: {e}")
+        if event_emitter:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Warning: Could not load builtin tools: {e}",
+                        "done": False,
+                    },
+                }
+            )
+
+    return tools_dict
+
+
+# ============================================================================
+# Shared Sub-Agent Context (deduplication)
+# ============================================================================
+
+
+class SubAgentContext(NamedTuple):
+    model_id: str
+    resolved_model: dict
+    user_valves: BaseModel
+    skill_manifest: str
+    user_skill_tags: list[str]
+    system_content: str
+    tools_dict: dict
+    common_extra_params: dict
+
+
+async def _prepare_sub_agent_context(
+    *,
+    valves: Any,
+    user_valves_cls: Type[BaseModel],
+    __user__: Optional[dict],
+    __request__: Request,
+    __model__: Optional[dict],
+    __metadata__: Optional[dict],
+    __id__: Optional[str],
+    __event_emitter__: Optional[Callable],
+    __event_call__: Optional[Callable],
+    __chat_id__: Optional[str],
+    __message_id__: Optional[str],
+    __oauth_token__: Optional[dict],
+    __messages__: Optional[list],
+) -> SubAgentContext:
+    """Shared setup for both run_sub_agent and run_parallel_sub_agents.
+
+    Returns a SubAgentContext with all resolved fields needed to launch sub-agents.
+    """
+    from open_webui.models.users import UserModel
+
+    user = UserModel(**__user__)
+
+    raw_user_valves = (__user__ or {}).get("valves", {})
+    user_valves = coerce_user_valves(raw_user_valves, user_valves_cls)
+
+    skill_manifest = extract_skill_manifest(__messages__)
+    user_skill_tags = extract_user_skill_tags(__messages__)
+
+    model_id = valves.DEFAULT_MODEL
+    if not model_id and __metadata__:
+        model_id = (__metadata__.get("model") or {}).get("id", "")
+    if not model_id and __model__:
+        model_id = __model__.get("id", "")
+
+    if not model_id:
+        raise ValueError(
+            "No model ID available. Set DEFAULT_MODEL in Valves if the issue persists."
+        )
+
+    resolved_model = __model__ or {}
+    if model_id and model_id != resolved_model.get("id", ""):
+        try:
+            resolved_model = __request__.app.state.MODELS.get(
+                model_id, resolved_model
+            )
+        except Exception:
+            pass
+
+    common_extra_params = {
+        "__user__": __user__,
+        "__event_emitter__": __event_emitter__,
+        "__event_call__": __event_call__,
+        "__request__": __request__,
+        "__model__": resolved_model,
+        "__metadata__": __metadata__,
+        "__chat_id__": __chat_id__,
+        "__message_id__": __message_id__,
+        "__oauth_token__": __oauth_token__,
+        "__files__": __metadata__.get("files", []) if __metadata__ else [],
+    }
+
+    tools_dict = await load_sub_agent_tools(
+        request=__request__,
+        user=user,
+        valves=valves,
+        metadata=__metadata__ or {},
+        model=resolved_model,
+        extra_params=common_extra_params,
+        self_tool_id=__id__,
+    )
+
+    if skill_manifest and valves.ENABLE_SKILLS_TOOLS:
+        await register_view_skill(tools_dict, __request__, common_extra_params)
+
+    system_content = user_valves.SYSTEM_PROMPT
+    if valves.ENABLE_SKILLS_TOOLS:
+        if user_skill_tags:
+            system_content += "\n\n" + "\n".join(user_skill_tags)
+        if skill_manifest:
+            system_content += "\n\n" + skill_manifest
+
+    return SubAgentContext(
+        model_id=model_id,
+        resolved_model=resolved_model,
+        user_valves=user_valves,
+        skill_manifest=skill_manifest,
+        user_skill_tags=user_skill_tags,
+        system_content=system_content,
+        tools_dict=tools_dict,
+        common_extra_params=common_extra_params,
+    )
+
+
+# ============================================================================
+# Tools class
+# ============================================================================
+
+
+class Tools:
+    """Sub-Agent tool for autonomous task completion."""
+
+    class Valves(BaseModel):
+        DEFAULT_MODEL: str = Field(
+            default="",
+            description="Default model ID for sub-agent tasks. Leave empty to use the same model as the main conversation.",
+        )
+        MAX_ITERATIONS: int = Field(
+            default=10,
+            description="Maximum number of tool call iterations for sub-agent.",
+        )
+        AVAILABLE_TOOL_IDS: str = Field(
+            default="",
+            description=(
+                "[Advanced] Comma-separated list of tool IDs available to sub-agents. "
+                "Leave empty (recommended) to use only tools enabled in the chat UI. "
+                "When set, ONLY these tools are available (overrides chat UI tool selection). "
+                "This controls regular tools only; builtin tools (web search, memory, etc.) "
+                "are controlled separately by the ENABLE_*_TOOLS toggles below. "
+                "WARNING: Mismatched tool sets between main AI and sub-agent can cause failures - "
+                "the main AI may instruct the sub-agent to use tools it doesn't have. "
+                "Tool server IDs (e.g., MCPO/OpenAPI) require 'server:' prefix (e.g., 'server:context7'). "
+                "To find exact tool IDs, enable DEBUG, enable the desired tools in the chat UI, "
+                "invoke the sub-agent, and check server logs for '[SubAgent] Available tool_ids from metadata'."
+            ),
+        )
+        EXCLUDED_TOOL_IDS: str = Field(
+            default="",
+            description=(
+                "Comma-separated list of tool IDs to exclude from sub-agents (e.g., this tool itself to prevent recursion). "
+                "This controls regular tools only; to disable builtin tools, use the ENABLE_*_TOOLS toggles. "
+                "If unsure about tool IDs or exclusion behavior, enable DEBUG and check server logs."
+            ),
+        )
+        APPLY_INLET_FILTERS: bool = Field(
+            default=True,
+            description="Apply inlet filters (e.g., user_info_injector) to sub-agent requests. Outlet filters are never applied to sub-agent responses.",
+        )
+
+        MAX_CONCURRENT_API_CALLS: int = Field(
+            default=2,
+            description=(
+                "Maximum number of concurrent generate_chat_completion API calls from sub-agents. "
+                "Subtract 1 from your API provider's concurrent model limit to reserve a slot for the main chat. "
+                "E.g., Ollama Cloud limit=3 → set to 2. "
+                "Set to 1 for maximum safety with very limited APIs."
+            ),
+        )
+        PARALLEL_EXECUTION: bool = Field(
+            default=False,
+            description=(
+                "When True, run_parallel_sub_agents executes tasks concurrently (faster). "
+                "When False (default), tasks run sequentially one at a time (safer for API-limited providers "
+                "like Ollama Cloud with concurrent model limits, or rate-limited tool APIs like Brave Search). "
+                "Recommendation: If your API provider allows 3+ concurrent models and no tool rate limits, set to True. "
+                "Otherwise keep False."
+            ),
+        )
+        TOOL_CALL_COOLDOWN: float = Field(
+            default=1.0,
+            description=(
+                "Seconds to wait between tool call iterations in sub-agent loops. "
+                "Helps avoid rate limits on tool APIs (e.g., Brave Search free tier: 1 request/sec). "
+                "Set to 0 to disable cooldown (for APIs with no rate limits)."
+            ),
+        )
+
+        ENABLE_TIME_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable time utilities (get_current_timestamp, calculate_timestamp). "
+                "NOTE for all ENABLE_*_TOOLS toggles: These can only disable builtin tools; "
+                "they cannot enable tools that are disabled by global admin settings, "
+                "model capabilities, or chat UI features (e.g., web search)."
+            ),
+        )
+        ENABLE_WEB_TOOLS: bool = Field(
+            default=True,
+            description="Enable web search tools (search_web, fetch_url).",
+        )
+        ENABLE_IMAGE_TOOLS: bool = Field(
+            default=True,
+            description="Enable image generation tools (generate_image, edit_image).",
+        )
+        ENABLE_KNOWLEDGE_TOOLS: bool = Field(
+            default=True,
+            description="Enable knowledge base tools (list/search/query knowledge bases and files).",
+        )
+        ENABLE_CHAT_TOOLS: bool = Field(
+            default=True,
+            description="Enable chat history tools (search_chats, view_chat).",
+        )
+        ENABLE_MEMORY_TOOLS: bool = Field(
+            default=True,
+            description="Enable memory tools (search_memories, add_memory, replace_memory_content).",
+        )
+        ENABLE_NOTES_TOOLS: bool = Field(
+            default=True,
+            description="Enable notes tools (search_notes, view_note, write_note, replace_note_content).",
+        )
+        ENABLE_CHANNELS_TOOLS: bool = Field(
+            default=True,
+            description="Enable channels tools (search_channels, search_channel_messages, etc.).",
+        )
+        ENABLE_TERMINAL_TOOLS: bool = Field(
+            default=True,
+            description=(
+                "Enable Open Terminal tools when terminal_id is available in chat metadata "
+                "(e.g., run_command, list_files, read_file, write_file, display_file)."
+            ),
+        )
+        ENABLE_CODE_INTERPRETER_TOOLS: bool = Field(
+            default=True,
+            description="Enable code interpreter tools (execute_code).",
+        )
+        ENABLE_SKILLS_TOOLS: bool = Field(
+            default=True,
+            description="Enable skills tools (view_skill). When enabled and the parent conversation has skills, the sub-agent can view skill contents.",
+        )
+        MAX_PARALLEL_AGENTS: int = Field(
+            default=2,
+            description="Maximum number of sub-agent tasks allowed in run_parallel_sub_agents. Sequential or parallel execution is controlled by PARALLEL_EXECUTION.",
+        )
+        DEBUG: bool = Field(
+            default=False,
+            description="Enable debug logging.",
+        )
+        pass
+
+    class UserValves(BaseModel):
+        SYSTEM_PROMPT: str = Field(
+            default="""\
+You are a sub-agent operating autonomously to complete a delegated task.
+
+CRITICAL RULES:
+1. You MUST complete the task fully without asking the user for confirmation or clarification.
+2. Continue working autonomously until the task is 100% complete.
+3. Use available tools proactively to gather information and perform actions.
+4. If you encounter obstacles, try alternative approaches before giving up.
+5. You have a limited number of tool call iterations. Complete the task before reaching the limit.
+
+RESPONSE REQUIREMENTS:
+- Provide a comprehensive final answer to the main agent.
+- Include evidence and reasoning that supports your conclusions.
+- If the task cannot be completed, explain what was attempted, why it failed, and provide actionable next steps the main agent should take.""",
+            description="System prompt for sub-agent tasks.",
+        )
+        pass
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def run_sub_agent(
+        self,
+        description: str,
+        prompt: str,
+        __user__: Optional[dict] = None,
+        __request__: Optional[Request] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        __event_call__: Optional[Callable[[dict], Any]] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
+        __oauth_token__: Optional[dict] = None,
+        __messages__: Optional[list] = None,
+    ) -> str:
+        """
+        Delegate a task to a sub-agent for autonomous completion.
+
+        MANDATORY: If a task requires 3+ steps of investigation or complex analysis,
+        you MUST NOT perform it yourself. Delegate to this tool immediately.
+        Only handle simple 1-2 tool call tasks yourself. When in doubt, delegate.
+
+        The sub-agent runs in an isolated context with access to the same tools.
+        It executes tools in a loop until completion, returning only the final result
+        to keep the main conversation context clean.
+
+        :param description: Brief task summary (shown to user as status)
+        :param prompt: Detailed instructions for the sub-agent
+        :return: Sub-agent's final response after task completion
+        """
+        if __request__ is None:
+            return json.dumps(
+                {"error": "Request context not available. Cannot run sub-agent."}
+            )
+
+        if __user__ is None:
+            return json.dumps(
+                {"error": "User context not available. Cannot run sub-agent."}
+            )
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Starting sub-agent: {description}",
+                        "done": False,
+                    },
+                }
+            )
+
+        try:
+            ctx = await _prepare_sub_agent_context(
+                valves=self.valves,
+                user_valves_cls=self.UserValves,
+                __user__=__user__,
+                __request__=__request__,
+                __model__=__model__,
+                __metadata__=__metadata__,
+                __id__=__id__,
+                __event_emitter__=__event_emitter__,
+                __event_call__=__event_call__,
+                __chat_id__=__chat_id__,
+                __message_id__=__message_id__,
+                __oauth_token__=__oauth_token__,
+                __messages__=__messages__,
+            )
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
+        messages = [
+            {"role": "system", "content": ctx.system_content},
+            {"role": "user", "content": prompt},
+        ]
+
+        if __event_emitter__:
+            tool_count = len(ctx.tools_dict)
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Sub-agent started with {tool_count} tools available",
+                        "done": False,
+                    },
+                }
+            )
+
+        try:
+            result = await run_sub_agent_loop(
+                request=__request__,
+                user=__user__,
+                model_id=ctx.model_id,
+                messages=messages,
+                tools_dict=ctx.tools_dict,
+                max_iterations=self.valves.MAX_ITERATIONS,
+                event_emitter=__event_emitter__,
+                extra_params=ctx.common_extra_params,
+                apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                max_concurrent_api_calls=self.valves.MAX_CONCURRENT_API_CALLS,
+                tool_call_cooldown=self.valves.TOOL_CALL_COOLDOWN,
+            )
+        except Exception as e:
+            log.exception(f"Error in sub-agent execution: {e}")
+            result = f"Sub-agent error: {e}"
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Sub-agent completed: {description}",
+                        "done": True,
+                    },
+                }
+            )
+
+        return json.dumps(
+            {
+                "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
+                "result": result,
+            },
+            ensure_ascii=False,
+        )
+
+    async def run_parallel_sub_agents(
+        self,
+        tasks: list[dict],
+        __user__: Optional[dict] = None,
+        __request__: Optional[Request] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+        __event_emitter__: Optional[Callable[[dict], Any]] = None,
+        __event_call__: Optional[Callable[[dict], Any]] = None,
+        __chat_id__: Optional[str] = None,
+        __message_id__: Optional[str] = None,
+        __oauth_token__: Optional[dict] = None,
+        __messages__: Optional[list] = None,
+    ) -> str:
+        """
+        Run multiple independent sub-agent tasks. Execution mode depends on PARALLEL_EXECUTION setting.
+
+        When PARALLEL_EXECUTION is True (Valves), tasks run concurrently - faster but
+        requires API capacity for multiple simultaneous model calls.
+
+        When PARALLEL_EXECUTION is False (default), tasks run sequentially - safer for
+        API-limited providers (e.g., Ollama Cloud with 3-model limit, Brave Search with
+        1 req/sec free tier).
+
+        All tasks share the same model and tools but run in isolated contexts.
+
+        :param tasks: List of task objects. Each must have "description" and "prompt".
+                      Craft each prompt as you would for run_sub_agent (role, context,
+                      specific instructions, expected output format, etc.).
+                      Example: [
+                          {"description": "Research topic A", "prompt": "You are a research specialist. ..."},
+                          {"description": "Analyze data B", "prompt": "You are a data analyst. ..."}
+                      ]
+        :return: JSON with "results" array in the same order as tasks.
+                 Each element has "description" and either "result" or "error".
+        """
+        if __request__ is None:
+            return json.dumps(
+                {"error": "Request context not available. Cannot run sub-agents."},
+                ensure_ascii=False,
+            )
+
+        if __user__ is None:
+            return json.dumps(
+                {"error": "User context not available. Cannot run sub-agents."},
+                ensure_ascii=False,
+            )
+
+        if not isinstance(tasks, list):
+            return json.dumps(
+                {
+                    "error": f"tasks must be a list, got {type(tasks).__name__}",
+                    "expected_format": '[{"description": "Task summary", "prompt": "Detailed instructions"}]',
+                },
+                ensure_ascii=False,
+            )
+
+        if not tasks:
+            return json.dumps({"error": "tasks array is empty"}, ensure_ascii=False)
+
+        if len(tasks) > self.valves.MAX_PARALLEL_AGENTS:
+            return json.dumps(
+                {
+                    "error": f"tasks count ({len(tasks)}) exceeds MAX_PARALLEL_AGENTS ({self.valves.MAX_PARALLEL_AGENTS})",
+                    "max_parallel_agents": self.valves.MAX_PARALLEL_AGENTS,
+                },
+                ensure_ascii=False,
+            )
+
+        validated_tasks = []
+        for i, task in enumerate(tasks):
+            if isinstance(task, str):
+                try:
+                    task = json.loads(task)
+                except (json.JSONDecodeError, TypeError):
+                    return json.dumps(
+                        {
+                            "error": f"tasks[{i}] must be an object, got unparseable string"
+                        },
+                        ensure_ascii=False,
+                    )
+            if not isinstance(task, dict):
+                return json.dumps(
+                    {"error": f"tasks[{i}] must be an object"},
+                    ensure_ascii=False,
+                )
+            if "description" not in task:
+                return json.dumps(
+                    {"error": f"tasks[{i}] missing 'description' field"},
+                    ensure_ascii=False,
+                )
+            if "prompt" not in task:
+                return json.dumps(
+                    {"error": f"tasks[{i}] missing 'prompt' field"},
+                    ensure_ascii=False,
+                )
+            if not isinstance(task.get("description"), str):
+                return json.dumps(
+                    {"error": f"tasks[{i}].description must be a string"},
+                    ensure_ascii=False,
+                )
+            if not isinstance(task.get("prompt"), str):
+                return json.dumps(
+                    {"error": f"tasks[{i}].prompt must be a string"},
+                    ensure_ascii=False,
+                )
+
+            description = task.get("description", "").strip()
+            prompt = task.get("prompt", "").strip()
+
+            if not description:
+                return json.dumps(
+                    {"error": f"tasks[{i}].description cannot be empty"},
+                    ensure_ascii=False,
+                )
+            if not prompt:
+                return json.dumps(
+                    {"error": f"tasks[{i}].prompt cannot be empty"},
+                    ensure_ascii=False,
+                )
+
+            validated_tasks.append({"description": description, "prompt": prompt})
+
+        try:
+            ctx = await _prepare_sub_agent_context(
+                valves=self.valves,
+                user_valves_cls=self.UserValves,
+                __user__=__user__,
+                __request__=__request__,
+                __model__=__model__,
+                __metadata__=__metadata__,
+                __id__=__id__,
+                __event_emitter__=__event_emitter__,
+                __event_call__=__event_call__,
+                __chat_id__=__chat_id__,
+                __message_id__=__message_id__,
+                __oauth_token__=__oauth_token__,
+                __messages__=__messages__,
+            )
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+        if __event_emitter__:
+            task_mapping = ", ".join(
+                f"[{i + 1}] {task['description']}"
+                for i, task in enumerate(validated_tasks)
+            )
+            mode_label = "parallel" if self.valves.PARALLEL_EXECUTION else "sequential"
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Running {len(validated_tasks)} sub-agents ({mode_label}): {task_mapping}",
+                        "done": False,
+                    },
+                }
+            )
+
+        async def run_single_task(task_index: int, task: dict) -> dict:
+            task_description = task["description"]
+            task_prompt = task["prompt"]
+
+            async def indexed_event_emitter(event: dict):
+                if not __event_emitter__:
+                    return
+
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "status"
+                    and isinstance(event.get("data"), dict)
+                ):
+                    prefixed_data = dict(event["data"])
+                    original_description = prefixed_data.get("description", "")
+                    if original_description:
+                        prefixed_data["description"] = (
+                            f"[{task_index}] {original_description}"
+                        )
+                    await __event_emitter__({"type": "status", "data": prefixed_data})
+                    return
+
+                await __event_emitter__(event)
+
+            try:
+                result = await run_sub_agent_loop(
+                    request=__request__,
+                    user=__user__,
+                    model_id=ctx.model_id,
+                    messages=[
+                        {"role": "system", "content": ctx.system_content},
+                        {"role": "user", "content": task_prompt},
+                    ],
+                    tools_dict=ctx.tools_dict,
+                    max_iterations=self.valves.MAX_ITERATIONS,
+                    event_emitter=indexed_event_emitter if __event_emitter__ else None,
+                    extra_params={
+                        **ctx.common_extra_params,
+                        "__event_emitter__": (
+                            indexed_event_emitter if __event_emitter__ else None
+                        ),
+                    },
+                    apply_inlet_filters=self.valves.APPLY_INLET_FILTERS,
+                    max_concurrent_api_calls=self.valves.MAX_CONCURRENT_API_CALLS,
+                    tool_call_cooldown=self.valves.TOOL_CALL_COOLDOWN,
+                )
+                return {"description": task_description, "result": result}
+            except Exception as e:
+                log.exception(
+                    f"Error in parallel sub-agent [{task_index}] {task_description}: {e}"
+                )
+                error_msg = str(e) or type(e).__name__
+                return {"description": task_description, "error": error_msg}
+
+        if self.valves.PARALLEL_EXECUTION:
+            task_coroutines = [
+                run_single_task(i + 1, task)
+                for i, task in enumerate(validated_tasks)
+            ]
+            gathered_results = await asyncio.gather(
+                *task_coroutines, return_exceptions=True
+            )
+
+            processed_results = []
+            for i, result in enumerate(gathered_results):
+                if isinstance(result, BaseException):
+                    processed_results.append(
+                        {
+                            "description": validated_tasks[i]["description"],
+                            "error": str(result) or type(result).__name__,
+                        }
+                    )
+                else:
+                    processed_results.append(result)
+        else:
+            processed_results = []
+            for i, task in enumerate(validated_tasks):
+                task_index = i + 1
+                try:
+                    result = await run_single_task(task_index, task)
+                    processed_results.append(result)
+                except Exception as e:
+                    log.exception(
+                        f"Error in sequential sub-agent [{task_index}] {task['description']}: {e}"
+                    )
+                    processed_results.append(
+                        {
+                            "description": task["description"],
+                            "error": str(e) or type(e).__name__,
+                        }
+                    )
+
+        if __event_emitter__:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": f"Sub-agents completed: {task_mapping}",
+                        "done": True,
+                    },
+                }
+            )
+
+        return json.dumps(
+            {
+                "note": "The user does NOT see this result directly - only you (the main agent) can see it.",
+                "results": processed_results,
+            },
+            ensure_ascii=False,
+        )

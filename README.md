@@ -19,7 +19,7 @@ A curated collection of [Open WebUI](https://github.com/open-webui/open-webui) t
 | [thinking-off](./Functions/thinking-off/) | [ticoneva](https://github.com/ticoneva) | — | MIT | Toggle reasoning/thinking for OpenRouter, Ollama, and local models |
 | [time-awareness](./Functions/time-awareness/) | @abhiraaid | — | — | Pass current time data on each message via filters |
 | [token-usage-display](./Functions/token-usage-display/) | assistant | — | MIT | Display input/output/total token counts and generation time below each AI response |
-| [zdr-private](./Functions/zdr-private/) | [byfebian](https://github.com/byfebian) | — | — | Toggle Zero Data Retention (ZDR) for OpenRouter requests |
+| [zdr-private](./Functions/zdr-private/) | [byfebian](https://github.com/byfebian) | — | MIT | Toggle Zero Data Retention (ZDR) for OpenRouter requests |
 
 ## Attribution
 
